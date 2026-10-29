@@ -1,0 +1,500 @@
+cd Intro-To-Computer-Vision# Lab Mid Exam: HOG vs SIFT on Blood-Cell Images
+
+**Computer Vision Lab** | Registration No: **010** | Name: Nayyab Gul | Roll No: FA23-BAI-010
+
+**Settings used:** seed = 10, HOG cell = 8 x 8, SIFT grid = 4 x 4 (16 keypoints). Dataset: BloodMNIST (size 64), classes eosinophil, monocyte, neutrophil, platelet; 100 train / 30 validation / 30 test images per class.
+
+## Summary of results
+
+| Pipeline | Feature length | Best C (validation) | Validation accuracy | Validation macro-F1 |
+|---|---|---|---|---|
+| HOG + SVM | 8100 | 0.1 | 72.50% | 0.7206 |
+| SIFT (grid) + SVM | 2048 | 1 | 77.50% | 0.7714 |
+
+| Model (test set) | Clean | Rotated 20 deg | Noisy (sigma 0.05) |
+|---|---|---|---|
+| HOG + SVM | 75.83 | 71.67 | 25.00 |
+| SIFT + SVM | 71.67 | 35.00 | 74.17 |
+
+HOG handles rotation well but collapses under noise; the SIFT grid handles noise well but collapses under rotation. Most confused classes for both models: eosinophil and monocyte.
+
+---
+
+```python
+!pip install -q medmnist opencv-python scikit-image scikit-learn pandas matplotlib
+```
+
+## Personal Settings
+
+```python
+import numpy as np, cv2, pandas as pd, matplotlib.pyplot as plt
+from skimage.feature import hog
+from skimage import exposure
+from sklearn.svm import LinearSVC
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, ConfusionMatrixDisplay
+
+REG_NO   = "010"
+SEED     = int(REG_NO[-2:])
+last     = int(REG_NO[-1])
+HOG_CELL = 8 if last % 2 == 0 else 16
+GRID     = 4 if last <= 4 else 6
+np.random.seed(SEED)
+rng = np.random.default_rng(SEED)
+
+print(f"Reg no {REG_NO} -> seed={SEED}, HOG cell={HOG_CELL}x{HOG_CELL}, SIFT grid={GRID}x{GRID} ({GRID*GRID} keypoints)")
+
+CLASS_IDS   = [1, 5, 6, 7]
+CLASS_NAMES = ["eosinophil", "monocyte", "neutrophil", "platelet"]
+N_TRAIN, N_VAL, N_TEST = 100, 30, 30
+C_GRID = [0.1, 1, 10]
+```
+
+Output:
+```text
+Reg no 010 -> seed=10, HOG cell=8x8, SIFT grid=4x4 (16 keypoints)
+```
+
+## Dataset storage
+
+```python
+import os, warnings
+warnings.filterwarnings("ignore")
+try:
+    from google.colab import drive
+    drive.mount("/content/drive")
+    ROOT = "/content/drive/MyDrive/CV_LabMid"
+except ImportError:
+    ROOT = os.path.abspath("CV_LabMid")
+os.makedirs(ROOT, exist_ok=True)
+print("Dataset folder:", ROOT)
+```
+
+Output:
+```text
+Mounted at /content/drive
+Dataset folder: /content/drive/MyDrive/CV_LabMid
+```
+
+# Q1. Data setup
+
+```python
+from medmnist import BloodMNIST
+
+raw = {s: BloodMNIST(split=s, download=True, size=64, root=ROOT) for s in ["train", "val", "test"]}
+
+def make_subset(ds, n_per_class):
+    imgs, labs = ds.imgs, ds.labels.ravel()
+    idx = []
+    for cid in CLASS_IDS:
+        pool = np.where(labs == cid)[0]
+        idx.extend(rng.choice(pool, size=n_per_class, replace=False))
+    idx = np.array(idx)
+    new_y = np.array([CLASS_IDS.index(l) for l in labs[idx]])
+    return imgs[idx], new_y
+
+def prep(imgs):
+
+    out = []
+    for im in imgs:
+        g = cv2.cvtColor(im, cv2.COLOR_RGB2GRAY)
+        g = cv2.resize(g, (128, 128), interpolation=cv2.INTER_LINEAR)
+        out.append(g.astype(np.float32) / 255.0)
+    return np.stack(out)
+
+def to_u8(X):
+    return np.clip(np.rint(X * 255), 0, 255).astype(np.uint8)
+
+sizes = {"train": N_TRAIN, "val": N_VAL, "test": N_TEST}
+data = {}
+for s in ["train", "val", "test"]:
+    imgs, y = make_subset(raw[s], sizes[s])
+    data[s] = (prep(imgs), y)
+
+Xtr, ytr = data["train"]; Xva, yva = data["val"]; Xte, yte = data["test"]
+for s, (X, y) in data.items():
+    counts = {CLASS_NAMES[i]: int((y == i).sum()) for i in range(4)}
+    print(f"{s:5s} X shape={X.shape}  y shape={y.shape}  class counts={counts}")
+
+np.savez_compressed(f"{ROOT}/subset_seed{SEED}.npz", Xtr=Xtr, ytr=ytr, Xva=Xva, yva=yva, Xte=Xte, yte=yte)
+print("Saved subset to Drive:", f"{ROOT}/subset_seed{SEED}.npz", "| dataset file(s):", [f for f in os.listdir(ROOT) if f.endswith('.npz')])
+```
+
+Output:
+```text
+train X shape=(400, 128, 128)  y shape=(400,)  class counts={'eosinophil': 100, 'monocyte': 100, 'neutrophil': 100, 'platelet': 100}
+val   X shape=(120, 128, 128)  y shape=(120,)  class counts={'eosinophil': 30, 'monocyte': 30, 'neutrophil': 30, 'platelet': 30}
+test  X shape=(120, 128, 128)  y shape=(120,)  class counts={'eosinophil': 30, 'monocyte': 30, 'neutrophil': 30, 'platelet': 30}
+Saved subset to Drive: /content/drive/MyDrive/CV_LabMid/subset_seed10.npz | dataset file(s): ['bloodmnist_64.npz', 'subset_seed10.npz']
+```
+
+> **Description (Q1):** BloodMNIST has 8 blood-cell types; I kept 4 (eosinophil=1, monocyte=5, neutrophil=6, platelet=7) and relabelled them 0 to 3. Using seed 10, I randomly picked 100 train, 30 validation and 30 test images per class (without repeats), converted them to grayscale and resized them to 128 x 128. The printed shapes confirm the sizes: train 400 images (4 x 100), validation 120 and test 120 (4 x 30), with perfectly balanced classes. The subset was also saved to Google Drive.
+
+```python
+fig, axes = plt.subplots(4, 4, figsize=(8, 8))
+for r, name in enumerate(CLASS_NAMES):
+    ids = np.where(ytr == r)[0][:4]
+    for c, i in enumerate(ids):
+        axes[r, c].imshow(Xtr[i], cmap="gray", vmin=0, vmax=1); axes[r, c].axis("off")
+    axes[r, 0].set_title(name, loc="left", fontsize=11)
+plt.suptitle("4 training examples per class (grayscale 128x128)"); plt.tight_layout(); plt.show()
+```
+
+![4 training examples per class](images/q1_examples_grid.png)
+
+> **Description:** Each row is one class (eosinophil, monocyte, neutrophil, platelet) and each row shows 4 training images. This confirms the images loaded correctly and the labels match the cells. Note that grayscale removes stain colour, only brightness and shape remain.
+
+# Q2. HOG + SVM
+
+### Q2(a) HOG feature length - calculation by hand (my cell size = 8 x 8)
+- Image = 128 x 128, cell = 8 x 8 -> cells per side = 128 / 8 = **16**, so 16 x 16 = 256 cells.
+- Block = 2 x 2 cells, stride = 1 cell -> blocks per side = 16 - 2 + 1 = **15**, so 15 x 15 = **225 blocks**.
+- Each block has 2 x 2 = 4 cells, each cell has 9 orientation bins -> 4 x 9 = **36 values per block**.
+- Feature length = 225 x 36 = **8100**.
+
+(If the cell size were 16 x 16: 8 cells/side, 7 blocks/side, 49 blocks, 49 x 36 = 1764. Not used here.)
+
+```python
+def hog_feat(img, vis=False):
+    return hog(img, orientations=9, pixels_per_cell=(HOG_CELL, HOG_CELL),
+               cells_per_block=(2, 2), block_norm="L2-Hys", visualize=vis, feature_vector=True)
+
+def hog_batch(X):
+    return np.array([hog_feat(im) for im in X])
+
+Htr, Hva = hog_batch(Xtr), hog_batch(Xva)
+
+cells_side  = 128 // HOG_CELL
+blocks_side = cells_side - 2 + 1
+expected    = blocks_side**2 * 2 * 2 * 9
+print("HOG feature length (code):", Htr.shape[1])
+print("By-hand formula:", f"{blocks_side}x{blocks_side} blocks x 4 cells x 9 bins =", expected)
+assert Htr.shape[1] == expected
+```
+
+Output:
+```text
+HOG feature length (code): 8100
+By-hand formula: 15x15 blocks x 4 cells x 9 bins = 8100
+```
+
+> **Description (Q2a):** HOG with 8 x 8 cells on a 128 x 128 image gives 16 x 16 cells; 2 x 2-cell blocks with stride 1 give 15 x 15 = 225 blocks; each block holds 4 cells x 9 bins = 36 values, so 225 x 36 = **8100** features. The code output (8100) matches my by-hand formula.
+
+```python
+fig, axes = plt.subplots(2, 4, figsize=(10, 5))
+for c, name in enumerate(CLASS_NAMES):
+    i = np.where(ytr == c)[0][0]
+    _, himg = hog_feat(Xtr[i], vis=True)
+    himg = exposure.rescale_intensity(himg, in_range=(0, himg.max() + 1e-9))
+    axes[0, c].imshow(Xtr[i], cmap="gray"); axes[0, c].set_title(name); axes[0, c].axis("off")
+    axes[1, c].imshow(himg, cmap="gray");   axes[1, c].set_title("HOG");  axes[1, c].axis("off")
+plt.tight_layout(); plt.show()
+```
+
+![HOG pictures, one image per class](images/q2_hog_pictures.png)
+
+> **Description (Q2b):** Top row is the original image, bottom row is its HOG picture. Bright short lines show the dominant edge direction in each 8 x 8 cell: strong lines follow the cell boundary and nucleus outline, while flat background gives almost nothing. This is exactly the information HOG passes to the SVM.
+
+```python
+def fit_select(Ftr, ytr, Fva, yva, name):
+
+    results, models = [], {}
+    for C in C_GRID:
+        m = make_pipeline(StandardScaler(), LinearSVC(C=C, max_iter=20000, random_state=SEED))
+        m.fit(Ftr, ytr)
+        p = m.predict(Fva)
+        results.append({"C": C, "val_acc": accuracy_score(yva, p), "val_macroF1": f1_score(yva, p, average="macro")})
+        models[C] = m
+    df = pd.DataFrame(results); print(df.to_string(index=False))
+    bestC = max(C_GRID, key=lambda c: (df.loc[df.C == c, "val_acc"].item(), df.loc[df.C == c, "val_macroF1"].item()))
+    model = models[bestC]; p = model.predict(Fva)
+    acc, f1 = accuracy_score(yva, p), f1_score(yva, p, average="macro")
+    cm = confusion_matrix(yva, p, labels=range(4))
+    print(f"\n{name}: best C = {bestC} | validation accuracy = {acc:.4f} | macro-F1 = {f1:.4f}")
+    print("Confusion matrix (rows = true, cols = predicted):\n", cm)
+    ConfusionMatrixDisplay(cm, display_labels=CLASS_NAMES).plot(cmap="Blues", xticks_rotation=30)
+    plt.title(f"{name} - validation"); plt.show()
+    return model, bestC, cm
+
+hog_model, hog_C, hog_cm = fit_select(Htr, ytr, Hva, yva, "HOG + SVM")
+```
+
+Output:
+```text
+   C  val_acc  val_macroF1
+ 0.1    0.725     0.720588
+ 1.0    0.725     0.720588
+10.0    0.725     0.720588
+
+HOG + SVM: best C = 0.1 | validation accuracy = 0.7250 | macro-F1 = 0.7206
+Confusion matrix (rows = true, cols = predicted):
+ [[16  4  9  1]
+ [ 8 18  3  1]
+ [ 2  4 24  0]
+ [ 1  0  0 29]]
+```
+
+![HOG + SVM validation confusion matrix](images/q2_hog_confusion.png)
+
+> **Description (Q2c, HOG + SVM):** The three C values (0.1, 1, 10) gave identical validation scores (accuracy 0.725, macro-F1 0.7206), so the tie-break picked the smallest, **C = 0.1**. Validation accuracy is **72.5%** (87 of 120 correct, the diagonal 16 + 18 + 24 + 29) and macro-F1 is **0.7206**. Platelet is almost perfect (29/30) and neutrophil is good (24/30). Eosinophil (16/30) and monocyte (18/30) are weakest: 8 monocytes were predicted as eosinophil and 9 eosinophils as neutrophil.
+
+# Q3. SIFT + SVM
+
+### Q3(a) Normal SIFT detection on training images
+
+```python
+sift = cv2.SIFT_create()
+Xtr_u8 = to_u8(Xtr)
+
+kp_counts = []
+for im in Xtr_u8:
+    kps, des = sift.detectAndCompute(im, None)
+    kp_counts.append(len(kps))
+kp_counts = np.array(kp_counts)
+print(f"Keypoints per image -> average: {kp_counts.mean():.2f}, min: {kp_counts.min()}, max: {kp_counts.max()}")
+print("Images with zero keypoints:", int((kp_counts == 0).sum()), "of", len(kp_counts))
+
+i = 0
+kps, _ = sift.detectAndCompute(Xtr_u8[i], None)
+vis = cv2.drawKeypoints(Xtr_u8[i], kps, None, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+plt.figure(figsize=(4, 4)); plt.imshow(vis); plt.title(f"{len(kps)} SIFT keypoints ({CLASS_NAMES[ytr[i]]})"); plt.axis("off"); plt.show()
+```
+
+Output:
+```text
+Keypoints per image -> average: 72.62, min: 7, max: 213
+Images with zero keypoints: 0 of 400
+```
+
+![Normal SIFT keypoints on one image](images/q3_sift_keypoints.png)
+
+> **Description (Q3a):** Normal SIFT finds a different number of keypoints on every image: average 72.62, minimum 7, maximum 213, and 0 of 400 images have zero keypoints. The picture shows the detected keypoints as circles (size = scale, line = orientation). Because the count varies, the concatenated descriptors would have different lengths per image, which an SVM cannot accept.
+
+**Why a varying keypoint count is a problem for an SVM:** each image gives a different number of 128-D descriptors, so the concatenated feature vectors have different lengths, but an SVM needs every sample to be a vector of the same fixed length (and images with zero keypoints would have no features at all).
+
+### Q3(b) Fixed grid of keypoints
+
+**Feature length by hand (my grid = 4 x 4):**
+- Grid points = 4 x 4 = **16** keypoints, placed at the centre of each 32 x 32 grid cell: x, y in {16, 48, 80, 112} on the 128 x 128 image.
+- Each SIFT descriptor has **128** values.
+- Feature length = 16 x 128 = **2048**.
+
+(For a 6 x 6 grid it would be 36 x 128 = 4608. Not used here.)
+
+```python
+step    = 128 // GRID
+centers = [step // 2 + step * k for k in range(GRID)]
+KP_SIZE = 32
+
+def grid_keypoints():
+
+    return [cv2.KeyPoint(float(x), float(y), float(KP_SIZE), 0.0) for y in centers for x in centers]
+
+def sift_feat(img_u8):
+    kps = grid_keypoints()
+    kps, des = sift.compute(img_u8, kps)
+    assert des is not None and des.shape == (GRID * GRID, 128), des.shape if des is not None else None
+    return des.reshape(-1)
+
+def sift_batch(X):
+    return np.array([sift_feat(im) for im in to_u8(X)])
+
+print("Grid centres:", centers)
+Str, Sva = sift_batch(Xtr), sift_batch(Xva)
+print("SIFT feature length (code):", Str.shape[1])
+print("By-hand formula:", f"{GRID*GRID} grid points x 128 =", GRID * GRID * 128)
+assert Str.shape[1] == GRID * GRID * 128
+```
+
+Output:
+```text
+Grid centres: [16, 48, 80, 112]
+SIFT feature length (code): 2048
+By-hand formula: 16 grid points x 128 = 2048
+```
+
+> **Description (Q3b):** Instead of detecting keypoints I place a regular 4 x 4 grid, centres at 16, 48, 80, 112 (step 32), each keypoint with size 32 and angle 0, and call `sift.compute`. Every image now gives 16 descriptors x 128 values = **2048** features, equal to my by-hand formula, so all images have the same fixed length.
+
+```python
+im = to_u8(Xtr[0])
+vis = cv2.drawKeypoints(im, grid_keypoints(), None, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+plt.figure(figsize=(4, 4)); plt.imshow(vis); plt.title("Fixed grid keypoints (size 32)"); plt.axis("off"); plt.show()
+```
+
+![Fixed 4x4 grid keypoints (size 32)](images/q3_grid_keypoints.png)
+
+> **Description:** The 16 circles are the fixed grid keypoints; each covers roughly one 32 x 32 block of the image, so together they tile the whole image evenly.
+
+### Q3(c) Train SIFT + SVM
+
+```python
+sift_model, sift_C, sift_cm = fit_select(Str, ytr, Sva, yva, "SIFT + SVM")
+```
+
+Output:
+```text
+   C  val_acc  val_macroF1
+ 0.1 0.766667     0.762212
+ 1.0 0.775000     0.771382
+10.0 0.775000     0.771382
+
+SIFT + SVM: best C = 1 | validation accuracy = 0.7750 | macro-F1 = 0.7714
+Confusion matrix (rows = true, cols = predicted):
+ [[17  5  6  2]
+ [ 7 23  0  0]
+ [ 3  2 24  1]
+ [ 0  0  1 29]]
+```
+
+![SIFT + SVM validation confusion matrix](images/q3_sift_confusion.png)
+
+> **Description (Q3c, SIFT + SVM):** Validation results: C = 0.1 gave 0.7667, C = 1 and C = 10 both gave 0.775, so **C = 1** was chosen (smaller C wins ties). Validation accuracy is **77.5%** (93 of 120 correct: 17 + 23 + 24 + 29) and macro-F1 is **0.7714**. Again platelet is best (29/30). Eosinophil is the weakest (17/30, spread to monocyte 5, neutrophil 6 and platelet 2). On validation data SIFT (77.5%) is better than HOG (72.5%) by 5 points.
+
+# Q4. Robustness
+
+### Q4(a) Prediction
+- **Rotation:** I think **HOG** will lose more accuracy. Reason: HOG histograms are tied to gradient directions inside fixed cells, so rotating the image changes both which orientation bins fill up and which cell contains which structure; the SIFT grid descriptor uses larger 32 x 32 patches with smoothing, so it changes less.
+- **Noise:** I think **HOG** will lose more accuracy. Reason: HOG is computed from raw pixel gradients over small 8 x 8 cells, and noise adds many random strong gradients; SIFT blurs the patch (Gaussian weighting) before measuring gradients, so it averages noise out.
+
+```python
+prediction = {"rotation": "HOG", "noise": "HOG"}
+print("My prediction:", prediction)
+```
+
+Output:
+```text
+My prediction: {'rotation': 'HOG', 'noise': 'HOG'}
+```
+
+> **Description:** My prediction, written before the test run: HOG will lose more accuracy under both rotation and noise.
+
+### Q4(b) Frozen models on the test set (clean / rotated 20 deg / noisy sigma=0.05)
+
+```python
+def rotate_all(X, deg=20):
+    M = cv2.getRotationMatrix2D((64, 64), deg, 1.0)
+    return np.stack([cv2.warpAffine(im, M, (128, 128), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0) for im in X])
+
+def noise_all(X, sigma=0.05):
+    nrng = np.random.default_rng(SEED)
+    return np.clip(X + nrng.normal(0, sigma, X.shape), 0, 1).astype(np.float32)
+
+tests = {"Clean": Xte, "Rotated": rotate_all(Xte, 20), "Noisy": noise_all(Xte, 0.05)}
+
+
+acc = {"HOG + SVM": {}, "SIFT + SVM": {}}
+for case, X in tests.items():
+    acc["HOG + SVM"][case]  = accuracy_score(yte, hog_model.predict(hog_batch(X)))
+    acc["SIFT + SVM"][case] = accuracy_score(yte, sift_model.predict(sift_batch(X)))
+
+table = pd.DataFrame(acc).T[["Clean", "Rotated", "Noisy"]]
+table.columns = ["Clean accuracy", "Rotated accuracy", "Noisy accuracy"]
+table.index.name = "Model"
+print((table * 100).round(2).to_string())
+
+fig, axes = plt.subplots(1, 3, figsize=(9, 3))
+for ax, (case, X) in zip(axes, tests.items()):
+    ax.imshow(X[0], cmap="gray", vmin=0, vmax=1); ax.set_title(case); ax.axis("off")
+plt.tight_layout(); plt.show()
+```
+
+Output:
+```text
+            Clean accuracy  Rotated accuracy  Noisy accuracy
+Model                                                       
+HOG + SVM            75.83             71.67           25.00
+SIFT + SVM           71.67             35.00           74.17
+```
+
+![Clean, rotated (20 deg) and noisy (sigma 0.05) test image](images/q4_clean_rotated_noisy.png)
+
+> **Description (Q4b):** Models were frozen (not retrained); the rotation or noise was applied to the test images first, then features were extracted and the saved models predicted. The images show the same cell as clean, rotated by 20 degrees (black corners appear because the border is filled with 0) and with Gaussian noise (sigma 0.05). Results (test accuracy %):
+
+| Model | Clean accuracy | Rotated accuracy | Noisy accuracy |
+|---|---|---|---|
+| HOG + SVM | 75.83 | 71.67 | 25.00 |
+| SIFT + SVM | 71.67 | 35.00 | 74.17 |
+
+HOG is better on clean images (75.83 vs 71.67) and under rotation (71.67 vs 35.00); SIFT is far better under noise (74.17 vs 25.00).
+
+### Q4(c) Was my prediction correct?
+
+```python
+drop = pd.DataFrame({
+    "rotation drop (pts)": (table["Clean accuracy"] - table["Rotated accuracy"]) * 100,
+    "noise drop (pts)":    (table["Clean accuracy"] - table["Noisy accuracy"]) * 100,
+}).round(2)
+print(drop.to_string())
+
+for case, col in [("rotation", "rotation drop (pts)"), ("noise", "noise drop (pts)")]:
+    worst = drop[col].idxmax().split(" ")[0]
+    ok = (worst == prediction[case])
+    print(f"{case}: bigger loss = {worst} (HOG {drop.loc['HOG + SVM', col]}, SIFT {drop.loc['SIFT + SVM', col]}); "
+          f"I predicted {prediction[case]} -> {'CORRECT' if ok else 'WRONG'}")
+```
+
+Output:
+```text
+            rotation drop (pts)  noise drop (pts)
+Model                                            
+HOG + SVM                  4.17             50.83
+SIFT + SVM                36.67             -2.50
+rotation: bigger loss = SIFT (HOG 4.17, SIFT 36.67); I predicted HOG -> WRONG
+noise: bigger loss = HOG (HOG 50.83, SIFT -2.5); I predicted HOG -> CORRECT
+```
+
+> **Description (Q4c):** Drop = clean accuracy minus accuracy after the change (in percentage points). Rotation: HOG lost 4.17 and SIFT lost 36.67, so SIFT lost more and my prediction (HOG) was **WRONG**. Noise: HOG lost 50.83 and SIFT lost -2.5 (it gained 2.5), so HOG lost more and my prediction was **CORRECT**.
+
+
+### Q4(c) Explanation (3 sentences, using the printed numbers)
+
+1. **Rotation:** SIFT dropped much more than HOG (36.67 vs 4.17 points), so my prediction that HOG would lose more under rotation was wrong.
+2. **Noise:** HOG dropped far more than SIFT (50.83 vs -2.5 points, SIFT even gained slightly), so my prediction that HOG would lose more under noise was correct.
+3. **Reason:** HOG, built from raw pixel gradients in small 8 x 8 cells, treats random noise as strong edges, so its accuracy fell to 25.00%, which is chance level for 4 balanced classes; the SIFT grid uses large smoothed 32 x 32 patches so noise averages out, but with `angle=0` it has no orientation normalisation and its descriptor changes when the image is rotated.
+
+**Overall:** neither model wins every case. HOG is best on clean data and under rotation; SIFT is best under noise. Looking at the worst case in the table, HOG's lowest accuracy is 25.00% and SIFT's lowest is 35.00%, and the three-case average is about 57.5% for HOG and 60.3% for SIFT, so the SIFT grid was slightly more reliable overall in this experiment, but the answer depends on whether noise or rotation is the bigger problem in practice.
+
+> Note: the grid keypoints use `angle=0`, so SIFT's orientation normalisation is NOT used; this SIFT variant is therefore not truly rotation-invariant.
+
+# Q5. Short answers and AI log
+
+**(a) Why does HOG use block normalisation?** Gradient magnitudes change with lighting and contrast, so the same cell can have very different histogram values in a bright and a dark image. Normalising the histograms over overlapping blocks of cells rescales them to a common range, which makes the features much less sensitive to illumination and contrast changes and improves classification.
+
+**(b) Why is it wrong to choose C using the test set?** The test set is supposed to be an unbiased estimate of performance on unseen data. If we pick C by looking at test accuracy, the model is tuned to that specific test data, so the reported accuracy becomes optimistically biased (information leakage) and no longer tells us how the model will do on new images. C must be tuned on the validation set, and the test set used only once at the end.
+
+```python
+def top_confused(cm):
+    sym = cm + cm.T
+    np.fill_diagonal(sym, 0)
+    a, b = np.unravel_index(np.argmax(np.triu(sym)), sym.shape)
+    return CLASS_NAMES[a], CLASS_NAMES[b], int(cm[a, b]), int(cm[b, a])
+
+for name, cm in [("HOG + SVM", hog_cm), ("SIFT + SVM", sift_cm)]:
+    a, b, ab, ba = top_confused(cm)
+    print(f"{name} (validation): most confused pair = {a} <-> {b}  ({a}->{b}: {ab}, {b}->{a}: {ba})")
+```
+
+Output:
+```text
+HOG + SVM (validation): most confused pair = eosinophil <-> monocyte  (eosinophil->monocyte: 4, monocyte->eosinophil: 8)
+SIFT + SVM (validation): most confused pair = eosinophil <-> monocyte  (eosinophil->monocyte: 5, monocyte->eosinophil: 7)
+```
+
+> **Description (Q5):** For both models the pair confused most on the validation set is **eosinophil <-> monocyte** (HOG: 4 + 8 = 12 mistakes, SIFT: 5 + 7 = 12 mistakes). This check uses the validation confusion matrices, not the test set.
+
+
+### Q5 (c) Most confused classes and grayscale
+
+Both models confused **eosinophil and monocyte** most (12 mistakes each in the printed output). Grayscale makes this harder because stain colour is a main cue for separating white blood cells: eosinophils have bright red-orange granules while monocytes have a bluish-grey cytoplasm. After converting to grayscale only brightness remains, so the two large cells look similar in size, brightness and texture, and HOG and SIFT, which only use edges and brightness, cannot tell them apart well.
+
+### Q5 (d) AI log
+
+*(Edit this table so it exactly matches what you really did.)*
+
+| # | Prompt (one line) | What I changed | How I checked it was correct |
+|---|---|---|---|
+| 1 | "Write data setup for BloodMNIST with 4 classes, 100/30/30 per class using a seed" | Used seed 10 from reg. no. 010 and saved the subset to Drive | Printed shapes and class counts (400/120/120, balanced) and looked at the image grid |
+| 2 | "HOG + LinearSVC with C chosen on validation" | Cell size 8 x 8 from my reg. no. | Printed feature length 8100 and matched it with my hand calculation |
+| 3 | "SIFT on a fixed grid with sift.compute" | 4 x 4 grid, keypoint size 32, angle 0 | Printed feature length 2048 = 16 x 128 and drew the grid keypoints |
+| 4 | "Rotate 20 degrees and add Gaussian noise before feature extraction" | Used a seeded noise generator | Displayed clean / rotated / noisy images, models were not refitted |
